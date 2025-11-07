@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
 yfinance
-python-ta
 pandas
 numpy
 pykrx
 redis
 requests
+setuptools
