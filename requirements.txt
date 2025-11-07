@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 yfinance
-talib-binary==0.4.28
+TA-Lib==0.4.28
 pandas
 numpy
 pykrx
