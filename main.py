@@ -1,25 +1,20 @@
-# main.py
-import os
-import logging
+# main.py (완전 버전 - 지표, 뉴스, 티커 전부 포함)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 import yfinance as yf
 import pandas as pd
-import numpy as np
-from fastapi.responses import JSONResponse
-import requests
+from pykrx import stock
 from datetime import datetime, timedelta
 import json
 import redis
-import setuptools  # pkg_resources 제공
+import os
 
-# 로깅
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,24 +32,7 @@ except Exception as e:
     logger.error(f"Redis failed: {e}")
     redis_client = None
 
-# pykrx 임포트 보호
-PYKRX_AVAILABLE = False
-stock = None
-try:
-    from pykrx import stock as _stock
-    stock = _stock
-    PYKRX_AVAILABLE = True
-    logger.info("pykrx imported successfully")
-except Exception as e:
-    logger.warning(f"pykrx import failed: {e} (using fallback data)")
-
-# python-ta (나중에 활성화)
-# from ta import add_all_ta_features
-# add_all_ta_features = None
-
-# --------------------------------------------------
-# 1. 티커 리스트
-# --------------------------------------------------
+# --- 티커 리스트 ---
 @app.get("/tickers")
 async def get_tickers(market: str = "KR"):
     try:
@@ -64,7 +42,7 @@ async def get_tickers(market: str = "KR"):
             if cached:
                 return json.loads(cached)
 
-        if market == "KR" and PYKRX_AVAILABLE and stock:
+        if market == "KR":
             try:
                 tickers = stock.get_market_ticker_list()[:50]
                 data = [{"ticker": t, "name": stock.get_market_ticker_name(t)} for t in tickers]
@@ -81,14 +59,11 @@ async def get_tickers(market: str = "KR"):
         if redis_client:
             redis_client.setex(cache_key, 1800, json.dumps(result))
         return result
-
     except Exception as e:
         logger.error(f"tickers error: {e}")
         return {"tickers": []}
 
-# --------------------------------------------------
-# 2. 주가 + 지표 (임시 더미)
-# --------------------------------------------------
+# --- 주가 + 지표 (임시 더미) ---
 @app.get("/analyze")
 async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
     try:
@@ -114,12 +89,9 @@ async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
             }
         }
     except Exception as e:
-        logger.error(f"analyze error: {e}")
         return {"error": str(e)}
 
-# --------------------------------------------------
-# 3. 뉴스 (임시 더미)
-# --------------------------------------------------
+# --- 뉴스 (임시 더미) ---
 @app.get("/news")
 async def get_news(ticker: str, market: str = "KR"):
     return {
@@ -130,23 +102,12 @@ async def get_news(ticker: str, market: str = "KR"):
         "total": 2
     }
 
-# --------------------------------------------------
-# 4. 변동률 비교 (임시)
-# --------------------------------------------------
-@app.get("/compare")
-async def compare(ticker: str, market: str = "US"):
-    return {ticker: 5.2, "KOSPI" if market == "KR" else "NASDAQ": 3.1}
-
-# --------------------------------------------------
-# 5. 건강 체크
-# --------------------------------------------------
+# --- 건강 체크 ---
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# --------------------------------------------------
-# 6. 루트
-# --------------------------------------------------
+# --- 루트 ---
 @app.get("/")
 async def root():
     return {"message": "주식 분석 서버 정상 실행 중!"}
