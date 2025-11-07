@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 yfinance
-TA-Lib==0.4.28
+python-ta
 pandas
 numpy
 pykrx
