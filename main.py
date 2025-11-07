@@ -1,8 +1,4 @@
-# --------------------------------------------------------------
-# main.py
-# --------------------------------------------------------------
-import os
-import logging
+# 파일명: main.py
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
@@ -14,15 +10,16 @@ from pykrx import stock
 from datetime import datetime, timedelta
 import json
 import redis
-from typing import List, Dict, Any
+import logging
+import os
 
-# ---------- 로깅 ----------
+# 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- FastAPI ----------
 app = FastAPI()
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Redis ----------
+# Redis 클라이언트 설정
 try:
     redis_client = redis.Redis(
         host='localhost',
@@ -47,16 +44,15 @@ except redis.ConnectionError as e:
     logger.error(f"Failed to connect to Redis: {e}")
     redis_client = None
 
-# ---------- python‑ta ----------
+# python-ta 임포트 (TA-Lib 대체)
 from ta import add_all_ta_features
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, ADXIndicator
 from ta.volatility import BollingerBands
 from ta.volume import MoneyFlowIndexIndicator
+from ta.others import UltimateOscillator  # CCI 대체용
 
-# --------------------------------------------------------------
-# 1. 티커 리스트 (KR / US)
-# --------------------------------------------------------------
+# 한글 종목명 매핑 (기존)
 KOREAN_TO_ENGLISH = {
     "삼성전자": "Samsung Electronics",
     "현대차": "Hyundai Motor",
@@ -73,49 +69,66 @@ KOREAN_TO_ENGLISH = {
 @app.get("/tickers")
 async def get_tickers(market: str = "KR"):
     try:
-        cache_key = f"tickers:{market}"
+        # Redis 캐시 확인
         if redis_client:
-            cached = redis_client.get(cache_key)
-            if cached:
-                logger.info(f"Cache hit for {cache_key}")
-                return json.loads(cached)
+            cache_key = f"tickers:{market}"
+            try:
+                cached_data = redis_client.get(cache_key)
+                if cached_data:
+                    logger.info(f"Cache hit for {cache_key}")
+                    if isinstance(cached_data, bytes):
+                        try:
+                            cached_data = cached_data.decode('utf-8')
+                        except UnicodeDecodeError as e:
+                            logger.error(f"Failed to decode cached data: {e}")
+                            redis_client.delete(cache_key)
+                            logger.warning(f"Deleted invalid cache {cache_key}")
+                    return json.loads(cached_data)
+            except redis.RedisError as e:
+                logger.error(f"Redis error while caching data: {e}")
 
         if market == "KR":
-            # pykrx 로 한국 주식 티커 가져오기 (간단히 100개)
-            tickers = stock.get_market_ticker_list()
-            data = [{"ticker": t, "name": stock.get_market_ticker_name(t)} for t in tickers[:200]]
+            # pykrx로 한국 주식 티커 (상위 50개로 제한)
+            tickers = stock.get_market_ticker_list(market="KOSPI")
+            data = [{"ticker": t, "name": stock.get_market_ticker_name(t)} for t in tickers[:50]]
         else:
-            # 미국은 yfinance 로 인기 종목만 (예시)
+            # US 인기 종목 예시
             data = [
-                {"ticker": "AAPL", "name": "Apple"},
-                {"ticker": "MSFT", "name": "Microsoft"},
-                {"ticker": "GOOGL", "name": "Alphabet"},
-                {"ticker": "AMZN", "name": "Amazon"},
-                {"ticker": "TSLA", "name": "Tesla"},
+                {"ticker": "AAPL", "name": "Apple Inc."},
+                {"ticker": "MSFT", "name": "Microsoft Corp."},
+                {"ticker": "GOOGL", "name": "Alphabet Inc."},
+                {"ticker": "AMZN", "name": "Amazon.com Inc."},
+                {"ticker": "TSLA", "name": "Tesla Inc."},
             ]
 
+        result = {"tickers": data}
         if redis_client:
-            redis_client.setex(cache_key, 1800, json.dumps({"tickers": data}))
-        return {"tickers": data}
+            try:
+                redis_client.setex(cache_key, 1800, json.dumps(result))
+                logger.info(f"Cached {cache_key}")
+            except redis.RedisError as e:
+                logger.error(f"Redis error while caching data: {e}")
+
+        return result
+
     except Exception as e:
-        logger.error(f"tickers error: {e}")
+        logger.error(f"❌ 티커 데이터 가져오기 오류: {e}")
         return {"tickers": []}
 
+def calculate_indicators(df: pd.DataFrame) -> dict:
+    """python-ta로 지표 계산 (TA-Lib 대체)"""
+    if len(df) < 30:  # 최소 데이터 부족 시 None 반환
+        return {k: None for k in ['RSI', 'MACD', 'CCI', 'MFI', 'ADX', 'SlowK', 'SlowD', 'SMA10', 'SMA50', 'EMA20', 'EMA50', 'BB_upper', 'BB_lower']}
 
-# --------------------------------------------------------------
-# 2. 주가·지표 분석 (/analyze)
-# --------------------------------------------------------------
-def calculate_indicators(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    python‑ta 로 모든 지표를 한 번에 계산하고,
-    현재(마지막 행) 값을 반환한다.
-    """
-    # 필수 컬럼만 남기기
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    # 컬럼 확인 및 정리
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = df['Close']  # 기본값으로 Close 사용
 
-    # 전체 TA 피처 추가
-    df = add_all_ta_features(
-        df,
+    # 모든 TA 피처 추가
+    df_ta = add_all_ta_features(
+        df[required_cols],
         open="Open",
         high="High",
         low="Low",
@@ -124,38 +137,36 @@ def calculate_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         fillna=True
     )
 
-    # 최신값
-    latest = df.iloc[-1]
+    # 최신값 추출 (NaN → None)
+    latest = df_ta.iloc[-1]
+    prev = df_ta.iloc[-2] if len(df_ta) > 1 else latest
 
-    # ---- 개별 지표 (앱에서 사용하는 이름) ----
     indicators = {
-        # 기본값
-        "RSI": latest.get("momentum_rsi"),
-        "MACD": latest.get("trend_macd"),
-        "MACD_prev": df["trend_macd"].iloc[-2] if len(df) > 1 else None,
-        "CCI": latest.get("trend_cci"),
-        "MFI": latest.get("volume_mfi"),
-        "ADX": latest.get("trend_adx"),
-        "SlowK": latest.get("momentum_stoch"),
-        "SlowD": latest.get("momentum_stoch_signal"),
-        "SMA10": latest.get("trend_sma_fast"),
-        "SMA50": latest.get("trend_sma_slow"),
-        "EMA20": latest.get("trend_ema_fast"),
-        "EMA50": latest.get("trend_ema_slow"),
-        "BB_upper": latest.get("volatility_bbh"),
-        "BB_lower": latest.get("volatility_bbl"),
+        'RSI': latest.get('momentum_rsi', None),
+        'MACD': latest.get('trend_macd', None),
+        'MACD_prev': prev.get('trend_macd', None),
+        'CCI': latest.get('trend_cci', None),  # CCI는 trend_cci로 대체
+        'MFI': latest.get('volume_mfi', None),
+        'ADX': latest.get('trend_adx', None),
+        'SlowK': latest.get('momentum_stoch', None),
+        'SlowD': latest.get('momentum_stoch_signal', None),
+        'SMA10': latest.get('trend_sma_fast', None),  # SMA10
+        'SMA50': latest.get('trend_sma_slow', None),  # SMA50
+        'EMA20': latest.get('trend_ema_fast', None),  # EMA20
+        'EMA50': latest.get('trend_ema_slow', None),  # EMA50
+        'BB_upper': latest.get('volatility_bbh', None),  # Bollinger Upper
+        'BB_lower': latest.get('volatility_bbl', None),  # Bollinger Lower
     }
 
-    # NaN → None
+    # NaN 처리
     for k, v in indicators.items():
         if pd.isna(v):
             indicators[k] = None
 
     return indicators
 
-
 @app.get("/analyze")
-async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
+async def fetch_stock_data(ticker: str, market: str = "US", period: str = "3mo"):
     try:
         cache_key = f"analyze:{ticker}:{market}:{period}"
         if redis_client:
@@ -164,29 +175,29 @@ async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
                 logger.info(f"Cache hit for {cache_key}")
                 return json.loads(cached)
 
-        # ---------- 데이터 다운로드 ----------
+        # 데이터 가져오기
         if market == "KR":
-            end = datetime.today().strftime("%Y%m%d")
-            start = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
-            df = stock.get_market_ohlcv_by_date(start, end, ticker)
-            df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+            end_date = datetime.today().strftime("%Y%m%d")
+            start_date = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
+            df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
+            df = df.rename(columns={
+                "시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"
+            })
         else:
-            data = yf.download(ticker, period=period, interval="1d")
-            df = data[['Open', 'High', 'Low', 'Close', 'Volume']]
+            df = yf.download(ticker, period=period, interval="1d")
 
         if df.empty:
-            raise ValueError("No price data")
+            raise ValueError("No data found")
 
         df = df.dropna().reset_index(drop=True)
 
-        # ---------- 지표 ----------
+        # 지표 계산
         indicators = calculate_indicators(df)
 
-        # ---------- 날짜 / 종가 ----------
-        dates = df.index.strftime("%Y-%m-%d").tolist()
+        # 결과
+        dates = df.index.astype(str).tolist()
         closes = df["Close"].round(2).tolist()
-        volumes = df["Volume"].tolist()
+        volumes = df["Volume"].fillna(0).astype(float).tolist()
 
         result = {
             "dates": dates,
@@ -201,95 +212,119 @@ async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
         return result
 
     except Exception as e:
-        logger.error(f"analyze error ({ticker}): {e}")
+        logger.error(f"analyze error: {e}")
         return {"error": str(e)}
 
-
-# --------------------------------------------------------------
-# 3. 뉴스 (네이버 검색 API 예시)
-# --------------------------------------------------------------
-NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "YOUR_ID")
-NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "YOUR_SECRET")
-
 @app.get("/news")
-async def get_news(ticker: str, market: str = "KR", start: int = 1, display: int = 10):
+async def fetch_news(ticker: str, market: str = "KR", start: int = 1, display: int = 10):
     try:
+        if redis_client:
+            cache_key = f"news:{ticker}:{market}:{start}:{display}"
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+
         query = ticker if market == "KR" else f"{ticker} stock"
         url = "https://openapi.naver.com/v1/search/news.json"
         headers = {
-            "X-Naver-Client-Id": NAVER_CLIENT_ID,
-            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+            "X-Naver-Client-Id": os.getenv("NAVER_CLIENT_ID", ""),
+            "X-Naver-Client-Secret": os.getenv("NAVER_CLIENT_SECRET", ""),
         }
         params = {"query": query, "display": display, "start": start, "sort": "date"}
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
         items = data.get("items", [])
         news_list = []
-        for it in items:
-            title = it.get("title", "").replace("<b>", "").replace("</b>", "")
-            link = it.get("link", "")
-            pub_date = it.get("pubDate", "")
-            # 간단 감성 키워드 (예시)
+        positive_keywords = ["상승", "호재", "강세", "매수"]
+        negative_keywords = ["하락", "악재", "약세", "매도"]
+        for item in items:
+            title = item.get("title", "").replace("<b>", "").replace("</b>", "")
+            url_link = item.get("link", "")
+            pub_date = item.get("pubDate", "")
             sentiment = "중립"
-            if any(w in title.lower() for w in ["상승", "호재", "강세"]):
+            title_lower = title.lower()
+            if any(kw in title_lower for kw in positive_keywords):
                 sentiment = "긍정"
-            elif any(w in title.lower() for w in ["하락", "악재", "약세"]):
+            elif any(kw in title_lower for kw in negative_keywords):
                 sentiment = "부정"
+            color = {"긍정": "green", "부정": "red", "중립": "yellow"}.get(sentiment, "yellow")
             news_list.append({
                 "title": title,
-                "url": link,
+                "url": url_link,
                 "date": pub_date,
                 "sentiment": sentiment,
-                "color": {"긍정": "green", "부정": "red", "중립": "yellow"}.get(sentiment, "yellow")
+                "color": color
             })
 
-        return {"news": news_list, "total": data.get("total", 0)}
+        result = {"news": news_list, "total": data.get("total", 0)}
+        if redis_client:
+            redis_client.setex(cache_key, 1800, json.dumps(result))
+        return result
+
     except Exception as e:
-        logger.error(f"news error: {e}")
+        logger.error(f"News fetch error: {e}")
         return {"news": [], "total": 0}
 
-
-# --------------------------------------------------------------
-# 4. 변동률 비교 (/compare)
-# --------------------------------------------------------------
 @app.get("/compare")
-async def compare(ticker: str, market: str = "US"):
+async def fetch_change_comparison(ticker: str, market: str = "US"):
     try:
-        tickers = [ticker, "^KS11", "^IXIC"]
-        changes = {}
+        tickers_to_compare = [ticker]
+        if market == "KR":
+            tickers_to_compare.append("^KS11")  # KOSPI
+        else:
+            tickers_to_compare.append("^IXIC")  # NASDAQ
 
-        for t in tickers:
+        changes = {}
+        for t in tickers_to_compare:
             if t == ticker and market == "KR":
-                end = datetime.today().strftime("%Y%m%d")
-                start = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
-                df = stock.get_market_ohlcv_by_date(start, end, t)
+                end_date = datetime.today().strftime("%Y%m%d")
+                start_date = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
+                df = stock.get_market_ohlcv_by_date(start_date, end_date, t)
                 df = df.rename(columns={"종가": "Close"})
+                df["Close"] = df["Close"].astype(float)
             else:
                 df = yf.download(t, period="3mo", interval="1d")
 
             if df.empty:
                 changes[t] = 0.0
                 continue
-            first = df["Close"].iloc[0]
-            last = df["Close"].iloc[-1]
-            change = ((last - first) / first) * 100
+
+            first_close = df["Close"].iloc[0]
+            last_close = df["Close"].iloc[-1]
+            change = ((last_close - first_close) / first_close) * 100
             changes[t] = round(float(change), 2)
 
-        return {
-            ticker: changes[ticker],
-            "KOSPI": changes["^KS11"],
-            "NASDAQ": changes["^IXIC"]
+        result = {
+            ticker: changes.get(ticker, 0.0),
+            "KOSPI" if market == "KR" else "NASDAQ": changes.get("^KS11" if market == "KR" else "^IXIC", 0.0)
         }
+
+        return result
+
     except Exception as e:
-        logger.error(f"compare error: {e}")
+        logger.error(f"❌ 변동률 비교 중 오류 발생: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.get("/ticker_info")
+async def fetch_ticker_info(ticker: str, market: str = "US"):
+    try:
+        if market == "KR":
+            name = stock.get_market_ticker_name(ticker)
+            return {"name": name or ticker}
+        else:
+            info = yf.Ticker(ticker).info
+            return {"name": info.get("longName", ticker)}
+    except Exception as e:
+        logger.error(f"❌ 종목 정보 요청 실패: {e}")
+        return {"name": ticker}
 
-# --------------------------------------------------------------
-# 5. 서버 상태 체크 (옵션)
-# --------------------------------------------------------------
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def check_server_status():
+    try:
+        if redis_client:
+            redis_client.ping()
+        return {"status": "healthy"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
